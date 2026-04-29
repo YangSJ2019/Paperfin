@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+data/papers/*.pdf
+data/thumbnails/*.jpg
+data/paperfin.db
+data/paperfin.db-*
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/

@@ -1,0 +1,41 @@
+# ---- Secrets / environment -------------------------------------------------
+# Never commit real credentials. `.env.example` is the canonical template.
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ---- OS / IDE --------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# ---- Runtime data ----------------------------------------------------------
+# PDFs, thumbnails, the SQLite DB, and logs are all user-generated; they
+# should live locally and never ship in the repo.
+backend/data/papers/*.pdf
+backend/data/thumbnails/*.jpg
+backend/data/*.db
+backend/data/*.db-*
+backend/data/logs/*.log
+frontend/logs/*.log
+
+# ---- Python ----------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+
+# ---- Node ------------------------------------------------------------------
+node_modules/
+dist/
+dist-ssr/

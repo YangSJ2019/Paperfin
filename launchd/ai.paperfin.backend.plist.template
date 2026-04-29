@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Paperfin backend LaunchAgent (template).
+
+      Do NOT install this file directly. Run `scripts/install-launchagents.sh`
+      which substitutes __PROJECT_ROOT__ with your absolute install path and
+      writes the resulting plist to ~/Library/LaunchAgents/.
+
+      - RunAtLoad + KeepAlive: start at login, restart if it crashes or exits.
+      - ThrottleInterval: if it crashes fast, wait 10s before relaunching
+        (prevents tight crash loops while still being responsive).
+      - WorkingDirectory is the backend/ folder so .env is picked up.
+      - StandardOut/StandardErrorPath capture uvicorn logs for debugging.
+      - LaunchAgents run under launchd's minimal env, NOT the user shell —
+        so shell-exported ANTHROPIC_* never reach this process, and
+        pydantic-settings reads everything from backend/.env cleanly.
+    -->
+    <key>Label</key>
+    <string>ai.paperfin.backend</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_ROOT__/backend/.venv/bin/uvicorn</string>
+        <string>app.main:app</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>8000</string>
+        <string>--reload</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_ROOT__/backend</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_ROOT__/backend/data/logs/backend.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_ROOT__/backend/data/logs/backend.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    </dict>
+</dict>
+</plist>
