@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     anthropic_base_url: str = ""
     anthropic_model: str = "claude-opus-4-7"
 
+    # Language the LLM uses for summaries and scoring rationales. Two values
+    # ship in the box — "en" (default) and "zh" (Simplified Chinese); adding a
+    # new language means adding one more prompt block in
+    # ``app/services/summarizer.py`` and ``app/services/quality.py``.
+    summary_language: str = "en"
+
     # --- External APIs ---------------------------------------------------
     semantic_scholar_api_key: str = ""
 

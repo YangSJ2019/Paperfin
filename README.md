@@ -5,8 +5,8 @@
 **A Jellyfin-style poster wall for your academic paper library.**
 
 Import papers from arXiv or any PDF URL, watch your reading list grow as
-a beautiful dark-themed gallery, and let an LLM write a structured Chinese
-summary and a 0–100 quality score for each one.
+a beautiful dark-themed gallery, and let an LLM write a structured summary
+and a 0–100 quality score for each one.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
@@ -20,16 +20,17 @@ summary and a 0–100 quality score for each one.
 
 - 📚 **Poster wall** — drop PDFs into a folder or paste an arXiv URL; each
   paper gets a first-page thumbnail and slots into a responsive grid.
-- 🧠 **LLM summaries (Chinese)** — structured `contribution / method / result`
-  paragraphs plus topical tags, not a one-line abstract.
+- 🧠 **Structured LLM summaries** — separate `contribution / method / result`
+  paragraphs plus topical tags, not a one-line abstract. Output language is
+  configurable (English by default; Simplified Chinese ships in the box).
 - ⭐ **Quality score** — 4-axis rubric (innovation, rigor, clarity,
   significance) weighted into a single 0–100 number, rendered as a radar chart.
 - 🔗 **URL import** — paste any `arxiv.org/abs/...`, `arxiv.org/pdf/...`, or
   direct PDF link; the backend streams the download, dedups by arxiv id +
   content hash, and runs the full pipeline.
-- 🦙 **Model-agnostic** — uses the Anthropic SDK, so you can point it at
-  Claude, or any Anthropic-compatible gateway (MiniMax, etc.). Swap base URL
-  and model in `.env`.
+- 🔌 **Model-agnostic** — uses the Anthropic SDK, so you can point it at
+  Claude, Amazon Bedrock Claude, or any gateway that speaks the Anthropic
+  Messages API (MiniMax's `api.minimaxi.com/anthropic` is a drop-in example).
 - 🎛 **Single-user, local-first** — no login, no cloud dependencies beyond the
   LLM API you configure. SQLite file lives next to the PDFs.
 - 🚀 **Optional auto-start** — ships with macOS LaunchAgent templates for a
@@ -45,7 +46,7 @@ summary and a 0–100 quality score for each one.
 flowchart LR
     FE["React + Vite + TW<br/>(poster wall + UI)"]
     BE["FastAPI + SQLModel<br/>─ pipeline (scrape / import)<br/>─ services/pdf_parser<br/>─ services/metadata_extractor<br/>─ services/summarizer<br/>─ services/quality<br/>─ services/url_ingest"]
-    LLM["Anthropic-compatible LLM<br/>(Claude / MiniMax / vLLM)"]
+    LLM["Claude / MiniMax / Bedrock Claude<br/>(any Anthropic Messages API endpoint)"]
 
     FE <-- "HTTP /api" --> BE
     BE --> LLM
@@ -58,15 +59,18 @@ flowchart LR
 - **Storage**: SQLite in `backend/data/paperfin.db`, PDFs in
   `backend/data/papers/`, thumbnails in `backend/data/thumbnails/`.
 
-> **Note on "Anthropic-compatible":** the backend talks to the LLM via the
+> **On "Anthropic-compatible":** the backend talks to the LLM through the
 > [Anthropic Messages API](https://docs.anthropic.com/en/api/messages)
-> (`/v1/messages`), not the OpenAI Chat Completions API (`/v1/chat/completions`).
-> These are two different wire protocols with different request and response
-> shapes — **the OpenAI SDK and OpenAI-compatible endpoints (DeepSeek, Zhipu,
-> Ollama's `/v1/chat/completions`, etc.) are NOT drop-in replacements.** To use
-> an OpenAI-family provider, either swap `app/services/llm.py` to call the
-> `openai` SDK instead, or put a translator like [LiteLLM](https://github.com/BerriAI/litellm)
-> in front of it.
+> (`/v1/messages`), *not* the OpenAI Chat Completions API
+> (`/v1/chat/completions`). These are two different wire protocols with
+> different request and response shapes — **the OpenAI SDK and
+> OpenAI-shape endpoints (DeepSeek, Zhipu, Ollama's `/v1/chat/completions`,
+> a vanilla vLLM server, etc.) are NOT drop-in replacements.** To use an
+> OpenAI-family provider, either swap `backend/app/services/llm.py` to call
+> the `openai` SDK instead, or put a translator like
+> [LiteLLM](https://github.com/BerriAI/litellm) in front of it (LiteLLM
+> exposes an Anthropic-shape endpoint that can forward to almost any
+> backend).
 
 ---
 
@@ -78,7 +82,7 @@ flowchart LR
 |---|---|
 | Python | 3.11 or newer |
 | Node | 18 or newer |
-| An LLM API key | Anthropic / MiniMax / any Anthropic-compatible gateway |
+| An LLM API key | Any endpoint that speaks the Anthropic Messages API (Claude, MiniMax, Amazon Bedrock Claude, LiteLLM, …) |
 
 ### 1. Backend
 
@@ -123,12 +127,13 @@ All config lives in `backend/.env` (see `.env.example`):
 | `ANTHROPIC_API_KEY` | API key for the LLM endpoint | *(required)* |
 | `ANTHROPIC_BASE_URL` | LLM endpoint URL | *(empty — official Anthropic)* |
 | `ANTHROPIC_MODEL` | Model name to send | `claude-opus-4-7` |
+| `SUMMARY_LANGUAGE` | Language for summaries + scoring rationales. `en` or `zh` | `en` |
 | `SEMANTIC_SCHOLAR_API_KEY` | Optional, boosts rate limits *(M3)* | *(empty)* |
 | `DATA_DIR` | Where PDFs, thumbnails, SQLite live | `./data` |
 | `SCAN_INTERVAL_HOURS` | Default subscription interval *(M4)* | `6` |
 | `LOG_LEVEL` | Python logging level | `INFO` |
 
-**Using MiniMax (or any Anthropic-compatible gateway):**
+**Using MiniMax as an Anthropic-shape gateway:**
 
 ```env
 ANTHROPIC_API_KEY=sk-your-minimax-key
@@ -136,13 +141,30 @@ ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic
 ANTHROPIC_MODEL=MiniMax-M2.7
 ```
 
-**Using a self-hosted model locally:**
+**Using a self-hosted model:**
 
-You need an endpoint that speaks the Anthropic Messages API — e.g. a vLLM
-server with the Anthropic-compatibility wrapper, or LiteLLM configured to
-translate from OpenAI to Anthropic. Ollama's default `/v1/chat/completions`
-endpoint is OpenAI-shape and **won't work** out of the box; either front it
-with LiteLLM or swap the SDK in `app/services/llm.py`.
+Paperfin needs an endpoint that speaks the Anthropic Messages API
+(`/v1/messages`). Most local inference servers — vLLM, Ollama,
+text-generation-webui — default to the OpenAI Chat Completions shape
+(`/v1/chat/completions`) and will **not** work if you just point
+`ANTHROPIC_BASE_URL` at them.
+
+Two workable paths:
+
+1. **Front it with LiteLLM** (recommended). [LiteLLM](https://github.com/BerriAI/litellm)
+   exposes an Anthropic-shape endpoint and can forward to whatever backend
+   you configure (vLLM, Ollama, OpenAI, your own cloud, …). Run it in front
+   of your local server and point `ANTHROPIC_BASE_URL` at the LiteLLM URL.
+2. **Swap the SDK**. Edit `backend/app/services/llm.py` to call the `openai`
+   SDK instead of `anthropic`, keeping the `chat_json(system, user, schema)`
+   contract unchanged. All other code is model-agnostic.
+
+**Changing summary language:**
+
+Set `SUMMARY_LANGUAGE=zh` in `.env` and restart the backend to get
+Simplified Chinese output from the summarizer and rubric reasoner. You can
+also re-summarize an existing paper from the detail page to pick up the
+new language without rescanning.
 
 ---
 
@@ -209,7 +231,7 @@ paperfin/
 │   │       ├── pdf_parser.py         # pypdf + PyMuPDF
 │   │       ├── llm.py                # Anthropic-SDK wrapper, chat_json()
 │   │       ├── metadata_extractor.py # title / authors / abstract
-│   │       ├── summarizer.py         # structured Chinese summary
+│   │       ├── summarizer.py         # structured summary (language from .env)
 │   │       ├── quality.py            # 4-axis LLM rubric → 0-100
 │   │       └── url_ingest.py         # arXiv URL parser + PDF download
 │   ├── data/                         # user-generated, gitignored
@@ -242,7 +264,7 @@ paperfin/
 ## Roadmap
 
 - ✅ **M1** — local poster wall, URL import, LLM summary & quality score,
-  Chinese summaries, optional auto-start.
+  configurable summary language, optional auto-start.
 - 🚧 **M2** — arXiv subscriptions (`cat:cs.LG AND abs:"diffusion"` style
   queries, cron-driven fetch, per-subscription min-quality filter).
 - 🚧 **M3** — Semantic Scholar enrichment (author h-index, venue, citation

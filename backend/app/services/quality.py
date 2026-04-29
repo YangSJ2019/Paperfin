@@ -6,10 +6,10 @@ single 0–100 headline score.
 
 The four axes:
 
-* **innovation (创新性)** – how novel are the ideas vs. prior work?
-* **rigor (严谨性)** – experimental design, ablations, statistical care, reproducibility
-* **clarity (清晰度)** – how well is the contribution explained, is the writing crisp?
-* **significance (重要性)** – likely impact on the field, generality of the ideas
+* **innovation** – how novel are the ideas vs. prior work?
+* **rigor** – experimental design, ablations, statistical care, reproducibility
+* **clarity** – how well is the contribution explained, is the writing crisp?
+* **significance** – likely impact on the field, generality of the ideas
 
 Weights mirror what most reading-group reviewers implicitly care about:
 
@@ -20,6 +20,9 @@ on ``Paper.score_llm`` lives in [0,100].
 
 For now the headline ``Paper.score`` is just ``score_llm`` — we'll mix in
 institution / venue / h-index scores in a later milestone (see M3 in the plan).
+
+The written rationale follows ``Settings.summary_language``; numerical scores
+are language-independent.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 
+from app.config import get_settings
 from app.services.llm import chat_json
 
 log = logging.getLogger(__name__)
@@ -42,15 +46,15 @@ MAX_INPUT_CHARS = 14000
 class LLMRubricScore(BaseModel):
     """Per-axis rubric scores (0-10 integers) plus a one-liner justification."""
 
-    innovation: int = Field(..., ge=0, le=10, description="0-10 创新性评分")
-    rigor: int = Field(..., ge=0, le=10, description="0-10 方法严谨性评分")
-    clarity: int = Field(..., ge=0, le=10, description="0-10 表达清晰度评分")
-    significance: int = Field(..., ge=0, le=10, description="0-10 重要性/影响力评分")
+    innovation: int = Field(..., ge=0, le=10, description="0-10 innovation score")
+    rigor: int = Field(..., ge=0, le=10, description="0-10 methodological rigor score")
+    clarity: int = Field(..., ge=0, le=10, description="0-10 clarity score")
+    significance: int = Field(..., ge=0, le=10, description="0-10 significance score")
     reasoning: str = Field(
         ...,
         description=(
-            "用 2-4 句中文说明为什么打这些分。要具体,最好能指出一两个"
-            "具体的亮点或不足。"
+            "2-4 sentences explaining the scores. Should call out at least one "
+            "concrete strength or weakness."
         ),
     )
 
@@ -74,7 +78,45 @@ _CLARITY_W = 0.15
 _SIGNIFICANCE_W = 0.25
 
 
-SYSTEM_PROMPT = (
+# -- Per-language prompt templates -------------------------------------------
+#
+# The rubric itself (axes, weights, score ranges) is language-independent.
+# Only the wording of the system prompt and the target language of the
+# ``reasoning`` field change.
+
+
+_SYSTEM_EN = (
+    "You are an experienced paper reviewer scoring a submission across four "
+    "axes. Read the paper text (typically title, authors, abstract, methods, "
+    "and experiments) and assign an integer 0-10 score on each axis:\n\n"
+    "1. innovation — how novel are the ideas vs. prior work?\n"
+    "   - 10 = paradigm-shifting, field-changing work\n"
+    "   - 7-8 = clearly beats SOTA, or proposes a genuinely new framework\n"
+    "   - 4-6 = meaningful improvement on an existing framework\n"
+    "   - 1-3 = incremental tweaks or near-duplicate work\n"
+    "   - 0   = essentially nothing new\n\n"
+    "2. rigor — experimental design, ablations, statistical care, "
+    "reproducibility, baseline coverage.\n"
+    "   - 10 = very thorough: multiple datasets, multiple baselines, many "
+    "ablations\n"
+    "   - 5-7 = main comparisons present but ablations or metrics are limited\n"
+    "   - 1-4 = clear gaps (missing important baselines or datasets)\n\n"
+    "3. clarity — writing, figures, structure; could a peer in the field read "
+    "this easily?\n\n"
+    "4. significance — likely impact on the community/industry; generality of "
+    "the ideas.\n\n"
+    "Strict requirements:\n"
+    "- All four scores must be integers in [0, 10]. Avoid flat 7-8 'safe "
+    "scores' — differentiate.\n"
+    "- If the paper text isn't enough to judge an axis, give a conservative 5 "
+    "and say 'insufficient information' in reasoning.\n"
+    "- Write reasoning in 2-4 English sentences, pointing at a concrete "
+    "strength or weakness. No fluff.\n"
+    "- Return ONLY a JSON object."
+)
+
+
+_SYSTEM_ZH = (
     "你是一名经验丰富的论文评审人,正在按照四个维度对一篇论文打分。"
     "你的任务是阅读论文文本(通常包含标题、作者、摘要、方法、实验等节选),"
     "然后根据评审标准用 0-10 的整数给四个维度打分:\n\n"
@@ -99,17 +141,35 @@ SYSTEM_PROMPT = (
 )
 
 
-def _build_user_prompt(text: str, *, title: str | None) -> str:
-    trimmed = text[:MAX_INPUT_CHARS]
+def _user_en(text: str, title: str | None) -> str:
+    header = f"Paper title: {title}\n\n" if title else ""
+    return (
+        f"{header}"
+        "Score the following paper across the four axes (innovation, rigor, "
+        "clarity, significance) as integers 0-10 and provide a short "
+        "English reasoning.\n\n"
+        "--- PAPER TEXT START ---\n"
+        f"{text}\n"
+        "--- PAPER TEXT END ---"
+    )
+
+
+def _user_zh(text: str, title: str | None) -> str:
     header = f"论文标题: {title}\n\n" if title else ""
     return (
         f"{header}"
         "请根据以下论文文本给出 4 个维度 (innovation, rigor, clarity, "
         "significance) 的 0-10 整数评分和一段简短的中文 reasoning。\n\n"
         "--- PAPER TEXT START ---\n"
-        f"{trimmed}\n"
+        f"{text}\n"
         "--- PAPER TEXT END ---"
     )
+
+
+_PROMPTS: dict[str, dict] = {
+    "en": {"system": _SYSTEM_EN, "user": _user_en},
+    "zh": {"system": _SYSTEM_ZH, "user": _user_zh},
+}
 
 
 def score_paper(text: str, *, title: str | None = None) -> QualityScore:
@@ -118,10 +178,18 @@ def score_paper(text: str, *, title: str | None = None) -> QualityScore:
     Returns a :class:`QualityScore` whose `.score` and `.score_llm` fields
     populate the identically-named columns on ``Paper``. Affiliation / fame /
     venue are left at 0 until we add those signals.
+
+    Language of the rubric's reasoning text follows
+    ``Settings.summary_language``; the numeric scores themselves are
+    language-independent.
     """
+    trimmed = text[:MAX_INPUT_CHARS]
+    lang = get_settings().summary_language.lower()
+    prompt = _PROMPTS.get(lang, _PROMPTS["en"])
+
     rubric = chat_json(
-        system=SYSTEM_PROMPT,
-        user=_build_user_prompt(text, title=title),
+        system=prompt["system"],
+        user=prompt["user"](trimmed, title),
         schema=LLMRubricScore,
         max_tokens=800,
     )
