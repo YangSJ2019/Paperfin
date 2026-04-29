@@ -41,22 +41,14 @@ summary and a 0–100 quality score for each one.
 
 ## Architecture
 
-```
-┌──────────────────────┐    HTTP /api     ┌─────────────────────────────┐
-│  React + Vite + TW   │ ───────────────▶ │  FastAPI + SQLModel          │
-│  (poster wall + UI)  │ ◀─────────────── │  ├─ pipeline (scrape/import) │
-└──────────────────────┘                  │  ├─ services/pdf_parser      │
-                                           │  ├─ services/metadata_…     │
-                                           │  ├─ services/summarizer     │
-                                           │  ├─ services/quality        │
-                                           │  └─ services/url_ingest     │
-                                           └─────────────────────────────┘
-                                                        │
-                                                        ▼
-                                           ┌─────────────────────────────┐
-                                           │ Anthropic-compatible LLM    │
-                                           │ (Claude / MiniMax / vLLM)   │
-                                           └─────────────────────────────┘
+```mermaid
+flowchart LR
+    FE["React + Vite + TW<br/>(poster wall + UI)"]
+    BE["FastAPI + SQLModel<br/>─ pipeline (scrape / import)<br/>─ services/pdf_parser<br/>─ services/metadata_extractor<br/>─ services/summarizer<br/>─ services/quality<br/>─ services/url_ingest"]
+    LLM["Anthropic-compatible LLM<br/>(Claude / MiniMax / vLLM)"]
+
+    FE <-- "HTTP /api" --> BE
+    BE --> LLM
 ```
 
 - **Backend**: Python 3.11+, FastAPI, SQLModel, SQLite, PyMuPDF, pypdf,
@@ -65,6 +57,16 @@ summary and a 0–100 quality score for each one.
   Recharts.
 - **Storage**: SQLite in `backend/data/paperfin.db`, PDFs in
   `backend/data/papers/`, thumbnails in `backend/data/thumbnails/`.
+
+> **Note on "Anthropic-compatible":** the backend talks to the LLM via the
+> [Anthropic Messages API](https://docs.anthropic.com/en/api/messages)
+> (`/v1/messages`), not the OpenAI Chat Completions API (`/v1/chat/completions`).
+> These are two different wire protocols with different request and response
+> shapes — **the OpenAI SDK and OpenAI-compatible endpoints (DeepSeek, Zhipu,
+> Ollama's `/v1/chat/completions`, etc.) are NOT drop-in replacements.** To use
+> an OpenAI-family provider, either swap `app/services/llm.py` to call the
+> `openai` SDK instead, or put a translator like [LiteLLM](https://github.com/BerriAI/litellm)
+> in front of it.
 
 ---
 
@@ -134,13 +136,13 @@ ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic
 ANTHROPIC_MODEL=MiniMax-M2.7
 ```
 
-**Using a local Ollama model:**
+**Using a self-hosted model locally:**
 
-```env
-ANTHROPIC_API_KEY=unused
-ANTHROPIC_BASE_URL=http://localhost:11434
-ANTHROPIC_MODEL=qwen2.5
-```
+You need an endpoint that speaks the Anthropic Messages API — e.g. a vLLM
+server with the Anthropic-compatibility wrapper, or LiteLLM configured to
+translate from OpenAI to Anthropic. Ollama's default `/v1/chat/completions`
+endpoint is OpenAI-shape and **won't work** out of the box; either front it
+with LiteLLM or swap the SDK in `app/services/llm.py`.
 
 ---
 
