@@ -28,9 +28,10 @@ and a 0–100 quality score for each one.
 - 🔗 **URL import** — paste any `arxiv.org/abs/...`, `arxiv.org/pdf/...`, or
   direct PDF link; the backend streams the download, dedups by arxiv id +
   content hash, and runs the full pipeline.
-- 🔌 **Model-agnostic** — uses the Anthropic SDK, so you can point it at
-  Claude, Amazon Bedrock Claude, or any gateway that speaks the Anthropic
-  Messages API (MiniMax's `api.minimaxi.com/anthropic` is a drop-in example).
+- 🔌 **Model-agnostic** — flip `LLM_PROVIDER=anthropic` for Claude / Bedrock /
+  MiniMax / LiteLLM, or `LLM_PROVIDER=openai` for ChatGPT / DeepSeek / Zhipu
+  / Groq / Ollama / vLLM. Same `chat_json(system, user, schema)` contract
+  inside the app; choose whichever model you have an account with.
 - 🎛 **Single-user, local-first** — no login, no cloud dependencies beyond the
   LLM API you configure. SQLite file lives next to the PDFs.
 - 🚀 **Optional auto-start** — ships with macOS LaunchAgent templates for a
@@ -45,32 +46,31 @@ and a 0–100 quality score for each one.
 ```mermaid
 flowchart LR
     FE["React + Vite + TW<br/>(poster wall + UI)"]
-    BE["FastAPI + SQLModel<br/>─ pipeline (scrape / import)<br/>─ services/pdf_parser<br/>─ services/metadata_extractor<br/>─ services/summarizer<br/>─ services/quality<br/>─ services/url_ingest"]
-    LLM["Claude / MiniMax / Bedrock Claude<br/>(any Anthropic Messages API endpoint)"]
+    BE["FastAPI + SQLModel<br/>─ pipeline (scrape / import)<br/>─ services/pdf_parser<br/>─ services/metadata_extractor<br/>─ services/summarizer<br/>─ services/quality<br/>─ services/url_ingest<br/>─ services/llm (provider dispatch)"]
+    LLM["Claude / ChatGPT / DeepSeek<br/>or anything speaking Anthropic or OpenAI API"]
 
     FE <-- "HTTP /api" --> BE
     BE --> LLM
 ```
 
 - **Backend**: Python 3.11+, FastAPI, SQLModel, SQLite, PyMuPDF, pypdf,
-  Anthropic SDK.
+  Anthropic SDK, OpenAI SDK.
 - **Frontend**: React 18 + Vite + TypeScript + TailwindCSS + React Query +
   Recharts.
 - **Storage**: SQLite in `backend/data/paperfin.db`, PDFs in
   `backend/data/papers/`, thumbnails in `backend/data/thumbnails/`.
 
-> **On "Anthropic-compatible":** the backend talks to the LLM through the
-> [Anthropic Messages API](https://docs.anthropic.com/en/api/messages)
-> (`/v1/messages`), *not* the OpenAI Chat Completions API
-> (`/v1/chat/completions`). These are two different wire protocols with
-> different request and response shapes — **the OpenAI SDK and
-> OpenAI-shape endpoints (DeepSeek, Zhipu, Ollama's `/v1/chat/completions`,
-> a vanilla vLLM server, etc.) are NOT drop-in replacements.** To use an
-> OpenAI-family provider, either swap `backend/app/services/llm.py` to call
-> the `openai` SDK instead, or put a translator like
-> [LiteLLM](https://github.com/BerriAI/litellm) in front of it (LiteLLM
-> exposes an Anthropic-shape endpoint that can forward to almost any
-> backend).
+> **Two wire protocols supported out of the box.** Pick one with
+> `LLM_PROVIDER` in `.env`:
+>
+> - `anthropic` — talks the [Anthropic Messages API](https://docs.anthropic.com/en/api/messages)
+>   (`POST /v1/messages`). Works with Claude, Amazon Bedrock Claude,
+>   [MiniMax's `/anthropic` endpoint](https://api.minimaxi.com/anthropic),
+>   [LiteLLM](https://github.com/BerriAI/litellm), etc.
+> - `openai` — talks the OpenAI Chat Completions API
+>   (`POST /v1/chat/completions`). Works with OpenAI, DeepSeek, Zhipu,
+>   Groq, and every local inference server that exposes the OpenAI shape
+>   (Ollama, vLLM, text-generation-webui, …).
 
 ---
 
@@ -82,13 +82,13 @@ flowchart LR
 |---|---|
 | Python | 3.11 or newer |
 | Node | 18 or newer |
-| An LLM API key | Any endpoint that speaks the Anthropic Messages API (Claude, MiniMax, Amazon Bedrock Claude, LiteLLM, …) |
+| An LLM API key | Any endpoint speaking the Anthropic Messages API **or** the OpenAI Chat Completions API (Claude, ChatGPT, DeepSeek, MiniMax, a local Ollama / vLLM, …) |
 
 ### 1. Backend
 
 ```bash
 cd backend
-cp .env.example .env            # fill in ANTHROPIC_API_KEY / BASE_URL / MODEL
+cp .env.example .env            # fill in LLM_PROVIDER / LLM_API_KEY / LLM_MODEL
 python3 -m venv .venv
 .venv/bin/pip install -e .
 .venv/bin/uvicorn app.main:app --reload --port 8000
@@ -124,42 +124,67 @@ All config lives in `backend/.env` (see `.env.example`):
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | API key for the LLM endpoint | *(required)* |
-| `ANTHROPIC_BASE_URL` | LLM endpoint URL | *(empty — official Anthropic)* |
-| `ANTHROPIC_MODEL` | Model name to send | `claude-opus-4-7` |
+| `LLM_PROVIDER` | `anthropic` (Messages API) or `openai` (Chat Completions API) | `anthropic` |
+| `LLM_API_KEY` | API key for the chosen provider | *(required)* |
+| `LLM_BASE_URL` | Override endpoint URL — e.g. a DeepSeek or LiteLLM URL | *(SDK default)* |
+| `LLM_MODEL` | Model name to send | `claude-opus-4-7` |
 | `SUMMARY_LANGUAGE` | Language for summaries + scoring rationales. `en` or `zh` | `en` |
 | `SEMANTIC_SCHOLAR_API_KEY` | Optional, boosts rate limits *(M3)* | *(empty)* |
 | `DATA_DIR` | Where PDFs, thumbnails, SQLite live | `./data` |
 | `SCAN_INTERVAL_HOURS` | Default subscription interval *(M4)* | `6` |
 | `LOG_LEVEL` | Python logging level | `INFO` |
 
-**Using MiniMax as an Anthropic-shape gateway:**
+> **Legacy `ANTHROPIC_*` variables still work.** Existing `.env` files that
+> set `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` are
+> read as fall-backs when the new `LLM_*` names aren't set; no edits
+> required to keep running.
+
+### Provider examples
+
+**Claude (official Anthropic):**
 
 ```env
-ANTHROPIC_API_KEY=sk-your-minimax-key
-ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic
-ANTHROPIC_MODEL=MiniMax-M2.7
+LLM_PROVIDER=anthropic
+LLM_API_KEY=sk-ant-your-key
+LLM_MODEL=claude-opus-4-7
 ```
 
-**Using a self-hosted model:**
+**OpenAI:**
 
-Paperfin needs an endpoint that speaks the Anthropic Messages API
-(`/v1/messages`). Most local inference servers — vLLM, Ollama,
-text-generation-webui — default to the OpenAI Chat Completions shape
-(`/v1/chat/completions`) and will **not** work if you just point
-`ANTHROPIC_BASE_URL` at them.
+```env
+LLM_PROVIDER=openai
+LLM_API_KEY=sk-your-key
+LLM_MODEL=gpt-4o
+```
 
-Two workable paths:
+**DeepSeek (OpenAI-shape):**
 
-1. **Front it with LiteLLM** (recommended). [LiteLLM](https://github.com/BerriAI/litellm)
-   exposes an Anthropic-shape endpoint and can forward to whatever backend
-   you configure (vLLM, Ollama, OpenAI, your own cloud, …). Run it in front
-   of your local server and point `ANTHROPIC_BASE_URL` at the LiteLLM URL.
-2. **Swap the SDK**. Edit `backend/app/services/llm.py` to call the `openai`
-   SDK instead of `anthropic`, keeping the `chat_json(system, user, schema)`
-   contract unchanged. All other code is model-agnostic.
+```env
+LLM_PROVIDER=openai
+LLM_API_KEY=sk-your-key
+LLM_BASE_URL=https://api.deepseek.com/v1
+LLM_MODEL=deepseek-chat
+```
 
-**Changing summary language:**
+**MiniMax (Anthropic-shape endpoint):**
+
+```env
+LLM_PROVIDER=anthropic
+LLM_API_KEY=sk-your-key
+LLM_BASE_URL=https://api.minimaxi.com/anthropic
+LLM_MODEL=MiniMax-M2.7
+```
+
+**Local Ollama (OpenAI-shape):**
+
+```env
+LLM_PROVIDER=openai
+LLM_API_KEY=ollama
+LLM_BASE_URL=http://localhost:11434/v1
+LLM_MODEL=qwen2.5
+```
+
+### Changing summary language
 
 Set `SUMMARY_LANGUAGE=zh` in `.env` and restart the backend to get
 Simplified Chinese output from the summarizer and rubric reasoner. You can

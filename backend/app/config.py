@@ -21,13 +21,27 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # --- LLM (Anthropic-compatible) --------------------------------------
-    # Point ``anthropic_base_url`` at a compatible gateway (e.g. MiniMax at
-    # https://api.minimaxi.com/anthropic) or leave empty to hit the official
-    # Anthropic API.
+    # --- LLM provider ----------------------------------------------------
+    # Two wire protocols are supported out of the box:
+    #   * "anthropic" — Claude, Amazon Bedrock Claude, MiniMax's Anthropic
+    #                   endpoint, LiteLLM, or anything else that serves the
+    #                   Anthropic Messages API (POST /v1/messages).
+    #   * "openai"    — OpenAI itself, DeepSeek, Zhipu, Ollama, vLLM, Groq,
+    #                   and any other server exposing Chat Completions
+    #                   (POST /v1/chat/completions).
+    # The common fields below are used by whichever provider you pick;
+    # unused ones are just ignored.
+    llm_provider: str = "anthropic"
+    llm_api_key: str = ""
+    llm_base_url: str = ""      # empty → SDK default (api.anthropic.com / api.openai.com)
+    llm_model: str = "claude-opus-4-7"
+
+    # --- Back-compat aliases --------------------------------------------
+    # Legacy .env files that only set ANTHROPIC_* still work; we map them
+    # onto the generic names if the new ones are blank.
     anthropic_api_key: str = ""
     anthropic_base_url: str = ""
-    anthropic_model: str = "claude-opus-4-7"
+    anthropic_model: str = ""
 
     # Language the LLM uses for summaries and scoring rationales. Two values
     # ship in the box — "en" (default) and "zh" (Simplified Chinese); adding a
@@ -66,6 +80,23 @@ class Settings(BaseSettings):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.papers_dir.mkdir(parents=True, exist_ok=True)
         self.thumbnails_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---------------------------------------------------------------------
+    # Resolved LLM credentials. We prefer the new generic ``llm_*`` fields
+    # but fall back to the legacy ``anthropic_*`` ones so existing .env
+    # files keep working without edits.
+
+    @property
+    def resolved_llm_api_key(self) -> str:
+        return self.llm_api_key or self.anthropic_api_key
+
+    @property
+    def resolved_llm_base_url(self) -> str:
+        return self.llm_base_url or self.anthropic_base_url
+
+    @property
+    def resolved_llm_model(self) -> str:
+        return self.llm_model or self.anthropic_model or "claude-opus-4-7"
 
 
 @lru_cache(maxsize=1)

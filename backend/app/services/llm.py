@@ -1,17 +1,26 @@
-"""Thin wrapper around the Anthropic (or Anthropic-compatible) SDK.
+"""Thin wrapper around an LLM provider (Anthropic SDK or OpenAI SDK).
 
-All AI calls in Paperfin funnel through ``chat_json`` so we get:
+All AI calls in Paperfin funnel through :func:`chat_json` so we get:
 
-* a single place to swap models (``Settings.anthropic_model``)
+* a single place to swap providers (``LLM_PROVIDER`` in ``.env``)
 * tenacity-backed retries for transient failures
-* schema-in-prompt + tolerant JSON parsing (works on real Claude
-  **and** on third-party Anthropic-compatible gateways like MiniMax
-  that don't honor the ``response_format`` family of parameters)
-* a Pydantic model validation step so downstream code sees structured data
+* schema-in-prompt + tolerant JSON parsing (works with either wire protocol
+  and with third-party gateways that may not honor structured-output
+  parameters)
+* a Pydantic-model validation step so downstream code sees structured data
 
-Point ``ANTHROPIC_BASE_URL`` at the gateway; leave it unset to hit the
-official Anthropic API. The ``chat_json(system, user, schema)`` contract
-is unchanged from the previous OpenAI-backed implementation.
+Two wire protocols are supported:
+
+============= =============================== ==============================
+provider      SDK used                        Endpoint shape
+============= =============================== ==============================
+``anthropic`` official ``anthropic`` SDK      POST /v1/messages
+``openai``    official ``openai`` SDK         POST /v1/chat/completions
+============= =============================== ==============================
+
+Set ``LLM_PROVIDER`` in ``.env`` to pick one. Credentials are taken from
+``LLM_API_KEY`` / ``LLM_BASE_URL`` / ``LLM_MODEL`` (with back-compat
+fallback to the older ``ANTHROPIC_*`` names — see ``config.py``).
 """
 
 from __future__ import annotations
@@ -19,9 +28,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import TypeVar
+from typing import Any, TypeVar
 
-from anthropic import Anthropic, APIError, APIStatusError
 from pydantic import BaseModel, ValidationError
 from tenacity import (
     before_sleep_log,
@@ -38,6 +46,9 @@ log = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 
+# --- Errors -----------------------------------------------------------------
+
+
 class LLMNotConfiguredError(RuntimeError):
     """Raised when the LLM is called without an API key configured."""
 
@@ -46,64 +57,150 @@ class LLMResponseError(RuntimeError):
     """Raised when the LLM response cannot be parsed into the expected shape."""
 
 
-_client: Anthropic | None = None
+# --- Client cache -----------------------------------------------------------
+
+# One client per provider, lazily initialised. Rebuilt whenever settings
+# change via ``reset_client`` (useful in tests).
+_clients: dict[str, Any] = {}
 
 
-def get_client() -> Anthropic:
-    """Return a singleton Anthropic client configured from settings."""
-    global _client
-    if _client is None:
-        settings = get_settings()
-        if not settings.anthropic_api_key:
+def reset_client() -> None:
+    _clients.clear()
+
+
+def _get_anthropic_client():
+    from anthropic import Anthropic  # local import — optional dep per provider
+
+    if "anthropic" not in _clients:
+        s = get_settings()
+        if not s.resolved_llm_api_key:
             raise LLMNotConfiguredError(
-                "ANTHROPIC_API_KEY is not set. Copy .env.example to .env and fill it in."
+                "LLM_API_KEY (or ANTHROPIC_API_KEY) is not set. "
+                "Copy .env.example to .env and fill it in."
             )
-        kwargs: dict[str, object] = {"api_key": settings.anthropic_api_key}
-        if settings.anthropic_base_url:
-            kwargs["base_url"] = settings.anthropic_base_url
-        _client = Anthropic(**kwargs)
-    return _client
+        kwargs: dict[str, Any] = {"api_key": s.resolved_llm_api_key}
+        if s.resolved_llm_base_url:
+            kwargs["base_url"] = s.resolved_llm_base_url
+        _clients["anthropic"] = Anthropic(**kwargs)
+    return _clients["anthropic"]
+
+
+def _get_openai_client():
+    from openai import OpenAI  # local import — optional dep per provider
+
+    if "openai" not in _clients:
+        s = get_settings()
+        if not s.resolved_llm_api_key:
+            raise LLMNotConfiguredError(
+                "LLM_API_KEY is not set. Copy .env.example to .env and fill it in."
+            )
+        kwargs: dict[str, Any] = {"api_key": s.resolved_llm_api_key}
+        if s.resolved_llm_base_url:
+            kwargs["base_url"] = s.resolved_llm_base_url
+        _clients["openai"] = OpenAI(**kwargs)
+    return _clients["openai"]
 
 
 # --- JSON extraction --------------------------------------------------------
 
-# Some models (and especially third-party shims) wrap JSON in ```json fences or
-# sprinkle explanatory prose before/after. Be tolerant.
+# Some models (and especially third-party shims) wrap JSON in ```json fences
+# or sprinkle explanatory prose around it. Be tolerant.
 _FENCE_RE = re.compile(r"```(?:json)?\s*(?P<body>\{.*?\}|\[.*?\])\s*```", re.DOTALL)
 
 
 def _extract_json_payload(raw: str) -> str:
-    """Return the best-effort JSON substring from a model response.
-
-    Strategy:
-    1. If the response is already valid JSON, return it.
-    2. If it's wrapped in a ```json ... ``` fence, extract the body.
-    3. Otherwise, grab the outermost ``{...}`` or ``[...]`` slice.
-    """
+    """Return the best-effort JSON substring from a model response."""
     stripped = raw.strip()
     if not stripped:
         return stripped
 
-    # 1. happy path
     try:
         json.loads(stripped)
         return stripped
     except json.JSONDecodeError:
         pass
 
-    # 2. fenced block
     m = _FENCE_RE.search(stripped)
     if m:
         return m.group("body").strip()
 
-    # 3. fall back to the outermost braces/brackets
     for open_ch, close_ch in (("{", "}"), ("[", "]")):
         start = stripped.find(open_ch)
         end = stripped.rfind(close_ch)
         if start != -1 and end != -1 and end > start:
             return stripped[start : end + 1]
 
-    return stripped  # hand the caller the raw string; json.loads will fail cleanly
+    return stripped
+
+
+# --- Provider-specific adapters ---------------------------------------------
+
+
+def _call_anthropic(
+    *, system: str, user: str, temperature: float, max_tokens: int, model: str
+) -> str:
+    from anthropic import APIError, APIStatusError
+
+    client = _get_anthropic_client()
+    try:
+        message = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+    except APIStatusError as exc:
+        log.error("LLM API status error (%s): %s", exc.status_code, exc)
+        raise LLMResponseError(
+            f"LLM request rejected ({exc.status_code}): {exc}"
+        ) from exc
+    except APIError as exc:
+        raise LLMResponseError(f"LLM request failed: {exc}") from exc
+    except Exception as exc:
+        raise LLMResponseError(f"LLM request failed: {exc}") from exc
+
+    parts = [b.text for b in message.content if getattr(b, "type", "") == "text"]
+    return "".join(parts).strip()
+
+
+def _call_openai(
+    *, system: str, user: str, temperature: float, max_tokens: int, model: str
+) -> str:
+    from openai import APIError, APIStatusError
+
+    client = _get_openai_client()
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            # Ask for a JSON object where the endpoint supports it; backends
+            # that don't honor this field just ignore it, and we still have
+            # the schema-in-prompt + tolerant extractor as defence in depth.
+            response_format={"type": "json_object"},
+        )
+    except APIStatusError as exc:
+        log.error("LLM API status error (%s): %s", exc.status_code, exc)
+        raise LLMResponseError(
+            f"LLM request rejected ({exc.status_code}): {exc}"
+        ) from exc
+    except APIError as exc:
+        raise LLMResponseError(f"LLM request failed: {exc}") from exc
+    except Exception as exc:
+        raise LLMResponseError(f"LLM request failed: {exc}") from exc
+
+    return (resp.choices[0].message.content or "").strip()
+
+
+_PROVIDERS = {
+    "anthropic": _call_anthropic,
+    "openai": _call_openai,
+}
 
 
 # --- Main entry point -------------------------------------------------------
@@ -126,13 +223,21 @@ def chat_json(
 ) -> T:
     """Run a chat completion and parse the response into ``schema``.
 
-    The system prompt automatically receives the schema's JSON fields so the
-    model has a strong signal about the desired shape, even when running
-    against gateways that don't implement response-format constraints.
+    The system prompt is augmented with the schema's JSON fields so any
+    model — Claude, GPT-4, DeepSeek, a local model behind LiteLLM — has a
+    strong signal about the desired shape, even when running against
+    gateways that don't implement structured-output constraints.
     """
     settings = get_settings()
-    client = get_client()
+    provider = (settings.llm_provider or "anthropic").lower()
+    call = _PROVIDERS.get(provider)
+    if call is None:
+        raise LLMNotConfiguredError(
+            f"Unknown LLM_PROVIDER={provider!r}. "
+            f"Supported: {', '.join(_PROVIDERS)}"
+        )
 
+    model = settings.resolved_llm_model
     schema_hint = json.dumps(schema.model_json_schema(), ensure_ascii=False)
     augmented_system = (
         f"{system}\n\n"
@@ -142,37 +247,20 @@ def chat_json(
     )
 
     log.debug(
-        "LLM call model=%s approx_prompt_chars=%d",
-        settings.anthropic_model,
+        "LLM call provider=%s model=%s approx_prompt_chars=%d",
+        provider,
+        model,
         len(augmented_system) + len(user),
     )
 
-    try:
-        message = client.messages.create(
-            model=settings.anthropic_model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=augmented_system,
-            messages=[{"role": "user", "content": user}],
-        )
-    except APIStatusError as exc:
-        # 4xx from the gateway: auth errors, bad model, malformed request.
-        # These are not worth retrying — fail fast with a readable error.
-        log.error("LLM API status error (%s): %s", exc.status_code, exc)
-        raise LLMResponseError(
-            f"LLM request rejected ({exc.status_code}): {exc}"
-        ) from exc
-    except APIError as exc:
-        # Connection / timeout / 5xx: let tenacity retry.
-        raise LLMResponseError(f"LLM request failed: {exc}") from exc
-    except Exception as exc:  # defensive: anything else (DNS, socket, etc.)
-        raise LLMResponseError(f"LLM request failed: {exc}") from exc
+    content = call(
+        system=augmented_system,
+        user=user,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        model=model,
+    )
 
-    # Claude returns ``content`` as a list of blocks. Concatenate every text block.
-    text_parts = [
-        block.text for block in message.content if getattr(block, "type", "") == "text"
-    ]
-    content = "".join(text_parts).strip()
     if not content:
         raise LLMResponseError("LLM returned an empty response")
 
@@ -180,9 +268,7 @@ def chat_json(
     try:
         payload = json.loads(payload_str)
     except json.JSONDecodeError as exc:
-        raise LLMResponseError(
-            f"LLM returned non-JSON: {content[:400]}"
-        ) from exc
+        raise LLMResponseError(f"LLM returned non-JSON: {content[:400]}") from exc
 
     try:
         return schema.model_validate(payload)
